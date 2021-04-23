@@ -1,0 +1,11 @@
+# Repo specific items
+*.a
+*.o
+*.lo
+*.la
+*.pc
+*.so*
+
+#meson
+/build
+/builddir

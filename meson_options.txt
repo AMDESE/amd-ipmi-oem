@@ -1,0 +1,4 @@
+option('PLATFORM_NAME',
+       type: 'string',
+       value: 'unknown',
+       description: 'AMD platform name')
