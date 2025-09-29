@@ -11,6 +11,7 @@ shared_library(
   'amd_oem.cpp',
   dependencies: [
     phosphor_logging,
+    pam,
   ],
   version: so_version,
   install: true,
