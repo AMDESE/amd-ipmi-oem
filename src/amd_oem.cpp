@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <ipmid/api.h>
+#include <ipmid/handler.hpp>
 #include <phosphor-logging/log.hpp>
 #include <random>
 #include <regex>
@@ -21,6 +22,7 @@ namespace ipmi {
 
 using namespace phosphor::logging;
 using namespace amd;
+bool credentialBootstrapping = true;
 
 static void registerOEMFunctions() __attribute__((constructor));
 
@@ -222,7 +224,7 @@ int pamUpdatePasswd(const char *username, const char *password) {
 
   pam_handle_t *localAuthHandle = NULL; // this gets set by pam_start
   int retval =
-      pam_start("passwd", username, &localConversation, &localAuthHandle);
+      pam_start("webserver", username, &localConversation, &localAuthHandle);
   if (retval != PAM_SUCCESS) {
     log<level::ERR>(
         ("pam_start failed. RETVAL=" + std::to_string(retval)).c_str());
@@ -239,12 +241,43 @@ int pamUpdatePasswd(const char *username, const char *password) {
   return pam_end(localAuthHandle, PAM_SUCCESS);
 }
 
+void setDisableCredBootstrap(const uint8_t disableCredBootstrap) {
+  const uint8_t credBootstrapEnabled = 0xA5;
+  if (disableCredBootstrap == credBootstrapEnabled) {
+    credentialBootstrapping = true;
+  } else {
+    credentialBootstrapping = false;
+  }
+  return;
+}
+
 ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
                                          ipmi_cmd_t /* cmd */,
-                                         ipmi_request_t /*request*/,
+                                         ipmi_request_t request,
                                          ipmi_response_t response,
                                          ipmi_data_len_t data_len,
                                          ipmi_context_t /*context*/) {
+  auto req = reinterpret_cast<GetBootstrapAccCreds *>(request);
+
+  if (*data_len != 2) {
+    log<level::ERR>(
+        "ipmiOemAMDGetBootStrapAccount: Request data lenghth invalid");
+    return IPMI_CC_REQ_DATA_LEN_INVALID;
+  }
+
+  const uint8_t groupExtIdentification = 0x52;
+  if (req->groupExtIdentification != groupExtIdentification) {
+    log<level::ERR>("ipmiOemAMDGetBootStrapAccount: Invalid group extension "
+                    "identification");
+    return IPMI_CC_INVALID_FIELD_REQUEST;
+  }
+
+  if (!credentialBootstrapping) {
+    log<level::ERR>("ipmiOemAMDGetBootStrapAccount: Credential BootStrapping "
+                    "Disabled; Get BootStrap Account command rejected.");
+    return IPMI_CC_OK;
+  }
+
   uint8_t *res = reinterpret_cast<uint8_t *>(response);
   std::string userName;
 
@@ -327,15 +360,16 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
       return IPMI_CC_RESPONSE_ERROR;
     }
   }
-  // Copy and pad userName (first 16 bytes)
-  std::fill(res, res + 16, 0); // Zero out first 16 bytes
-  std::copy_n(userName.begin(), std::min<size_t>(userName.size(), 16), res);
 
-  // Copy and pad password (next 16 bytes)
-  std::fill(res + 16, res + 32, 0); // Zero out next 16 bytes
+  setDisableCredBootstrap(req->disableCredBootstrap);
+  res[0] = groupExtIdentification;
+
+  // Pad userName and password (32 bytes)
+  std::fill(res + 1, res + 33, 0); // Zero out 32 bytes
+  std::copy_n(userName.begin(), std::min<size_t>(userName.size(), 16), res + 1);
   std::copy_n(password.begin(), std::min<size_t>(password.size(), 16),
-              res + 16);
-  *data_len = 32;
+              res + 17);
+  *data_len = 33;
 
   return IPMI_CC_OK;
 }
@@ -343,6 +377,7 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
 void registerOEMFunctions(void) {
   ipmi_register_callback(NETFN_OEM_AMD, CMD_OEM_PLATFORM_ID, nullptr,
                          ipmiOemAMDPlatID, PRIVILEGE_USER);
+  // TODO Add CMD_OEM_GET_BOOT_STRAP_ACC under net function 0x2C
   ipmi_register_callback(NETFN_OEM_AMD, CMD_OEM_GET_BOOT_STRAP_ACC, nullptr,
                          ipmiOemAMDGetBootStrapAccount, SYSTEM_INTERFACE);
 }
