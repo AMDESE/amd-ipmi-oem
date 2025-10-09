@@ -23,4 +23,9 @@ struct AMDIANAHeader {
   uint8_t iana[3];
 } __attribute__((packed));
 
+struct GetBootstrapAccCreds {
+  uint8_t groupExtIdentification;
+  uint8_t disableCredBootstrap;
+} __attribute__((packed));
+
 } // namespace amd
