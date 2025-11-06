@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <ipmid/api.h>
+#include <ipmid/handler.hpp>
 #include <phosphor-logging/log.hpp>
 #include <random>
 #include <regex>
@@ -21,28 +22,23 @@ namespace ipmi {
 
 using namespace phosphor::logging;
 using namespace amd;
+bool credentialBootstrapping = true;
 
-static void registerOEMFunctions() __attribute__((constructor));
+// static void registerOEMFunctions() __attribute__((constructor));
+void registerOEMFunctions() __attribute__((constructor(101)));
 
-ipmi_ret_t ipmiOemAMDPlatID(ipmi_netfn_t /* netfn */, ipmi_cmd_t /* cmd */,
-                            ipmi_request_t request, ipmi_response_t response,
-                            ipmi_data_len_t data_len,
-                            ipmi_context_t /* context */) {
-  auto amd_h = reinterpret_cast<AMDIANAHeader *>(request);
-  uint8_t *res = reinterpret_cast<uint8_t *>(response);
-
-  if (*data_len != 3)
-    return IPMI_CC_REQ_DATA_LEN_INVALID;
-
-  if ((amd_h->iana[0] | amd_h->iana[1] << 8) != AMD_IANA_ID)
-    return IPMI_CC_INVALID_FIELD_REQUEST;
+// sample skeleton function
+ipmi::RspType<uint8_t, uint8_t, uint8_t>
+ipmiOemAMDPlatID(Context::ptr ctx) {
+  (void)ctx;
 
   log<level::INFO>("AMD platform " PLATFORM_NAME);
-  res[0] = PLATFORM_NAME[0];
-  res[1] = PLATFORM_NAME[1];
-  res[2] = PLATFORM_NAME[2];
 
-  return IPMI_CC_OK;
+  uint8_t res0 = static_cast<uint8_t>(PLATFORM_NAME[0]);
+  uint8_t res1 = static_cast<uint8_t>(PLATFORM_NAME[1]);
+  uint8_t res2 = static_cast<uint8_t>(PLATFORM_NAME[2]);
+
+  return ipmi::responseSuccess(res0, res1, res2);
 }
 
 bool getRandomUserName(std::string &uniqueStr) {
@@ -222,7 +218,7 @@ int pamUpdatePasswd(const char *username, const char *password) {
 
   pam_handle_t *localAuthHandle = NULL; // this gets set by pam_start
   int retval =
-      pam_start("passwd", username, &localConversation, &localAuthHandle);
+      pam_start("webserver", username, &localConversation, &localAuthHandle);
   if (retval != PAM_SUCCESS) {
     log<level::ERR>(
         ("pam_start failed. RETVAL=" + std::to_string(retval)).c_str());
@@ -239,13 +235,29 @@ int pamUpdatePasswd(const char *username, const char *password) {
   return pam_end(localAuthHandle, PAM_SUCCESS);
 }
 
-ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
-                                         ipmi_cmd_t /* cmd */,
-                                         ipmi_request_t /*request*/,
-                                         ipmi_response_t response,
-                                         ipmi_data_len_t data_len,
-                                         ipmi_context_t /*context*/) {
-  uint8_t *res = reinterpret_cast<uint8_t *>(response);
+void setDisableCredBootstrap(const uint8_t disableCredBootstrap) {
+  const uint8_t credBootstrapEnabled = 0xA5;
+  if (disableCredBootstrap == credBootstrapEnabled) {
+    credentialBootstrapping = true;
+  } else {
+    credentialBootstrapping = false;
+  }
+  return;
+}
+
+//@param disableCredBootstrap as per Redfish groupExtId for getBootstrapAcc 
+//@return when success, return 32-bytes (16-byte username, 16-byte password)
+ipmi::RspType<std::vector<uint8_t>>
+ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
+
+  (void)ctx;
+
+  if (!credentialBootstrapping) {
+    log<level::ERR>("ipmiOemAMDGetBootStrapAccount: Credential BootStrapping "
+                    "Disabled; Get BootStrap Account command rejected.");
+    return ipmi::responseCommandDisabled();
+  }
+
   std::string userName;
 
   bool ret = getRandomUserName(userName);
@@ -253,12 +265,12 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
     log<level::ERR>(
         "ipmiOemAMDGetBootStrapAccount: Failed to generate alphanumeric "
         "UserName");
-    return IPMI_CC_RESPONSE_ERROR;
+    return ipmi::responseResponseError();
   }
   if (!isValidUserName(userName)) {
     log<level::ERR>(
         "ipmiOemAMDGetBootStrapAccount: Failed to generate valid UserName");
-    return IPMI_CC_RESPONSE_ERROR;
+    return ipmi::responseResponseError();
   }
   auto bus = sdbusplus::bus::new_default();
   const std::string userMgrService = "xyz.openbmc_project.User.Manager";
@@ -278,12 +290,12 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
     auto reply = bus.call(method);
     if (reply.is_method_error()) {
       log<level::ERR>("D-Bus CreateUser failed");
-      return IPMI_CC_RESPONSE_ERROR;
+      return ipmi::responseResponseError();
     }
   } catch (const std::exception &e) {
     log<level::ERR>("Exception during D-Bus user creation",
                     phosphor::logging::entry("EX=%s", e.what()));
-    return IPMI_CC_RESPONSE_ERROR;
+    return ipmi::responseResponseError();
   }
 
   std::string password;
@@ -296,7 +308,7 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
       log<level::ERR>(
           "ipmiOemAMDGetBootStrapAccount: Failed to generate alphanumeric "
           "Password");
-      return IPMI_CC_RESPONSE_ERROR;
+      return ipmi::responseResponseError();
     }
     passwordIsValid = isValidPassword(password);
     max_retries--;
@@ -305,7 +317,7 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
   if (!passwordIsValid) {
     log<level::ERR>("ipmiOemAMDGetBootStrapAccount: Failed to generate valid "
                     "Password");
-    return IPMI_CC_RESPONSE_ERROR;
+    return ipmi::responseResponseError();
   }
 
   // update the password
@@ -319,32 +331,40 @@ ipmi_ret_t ipmiOemAMDGetBootStrapAccount(ipmi_netfn_t /* netfn */,
       auto reply = bus.call(method);
       if (reply.is_method_error()) {
         log<level::ERR>("D-Bus Delete failed");
-        return IPMI_CC_RESPONSE_ERROR;
+        return ipmi::responseResponseError();
       }
     } catch (const std::exception &e) {
       log<level::ERR>("Exception during D-Bus user creation",
                       phosphor::logging::entry("EX=%s", e.what()));
-      return IPMI_CC_RESPONSE_ERROR;
+      return ipmi::responseResponseError();
     }
   }
-  // Copy and pad userName (first 16 bytes)
-  std::fill(res, res + 16, 0); // Zero out first 16 bytes
-  std::copy_n(userName.begin(), std::min<size_t>(userName.size(), 16), res);
 
-  // Copy and pad password (next 16 bytes)
-  std::fill(res + 16, res + 32, 0); // Zero out next 16 bytes
-  std::copy_n(password.begin(), std::min<size_t>(password.size(), 16),
-              res + 16);
-  *data_len = 32;
+  setDisableCredBootstrap(disableCredBootstrap);
 
-  return IPMI_CC_OK;
+  std::vector<uint8_t> res(32, 0); // 32 elements, all initialized to 0
+
+  // Pad userName and password (32 bytes)
+  std::memcpy(res.data(),            userName.data(), 16);
+  std::memcpy(res.data() + 16,       password.data(), 16);
+
+  return ipmi::responseSuccess(res);
 }
 
 void registerOEMFunctions(void) {
-  ipmi_register_callback(NETFN_OEM_AMD, CMD_OEM_PLATFORM_ID, nullptr,
-                         ipmiOemAMDPlatID, PRIVILEGE_USER);
-  ipmi_register_callback(NETFN_OEM_AMD, CMD_OEM_GET_BOOT_STRAP_ACC, nullptr,
-                         ipmiOemAMDGetBootStrapAccount, SYSTEM_INTERFACE);
+
+  //NetFn=0x2C (For groupHandler)
+  ipmi::registerGroupHandler(ipmi::prioOemBase,
+                             amd::REDFISH_BOOTSTRAP_GRPEXT_ID,
+                             amd::CMD_PLATFORM_ID,
+                             ipmi::Privilege::User,
+                             ipmiOemAMDPlatID);
+
+  ipmi::registerGroupHandler(ipmi::prioOemBase,
+                             amd::REDFISH_BOOTSTRAP_GRPEXT_ID,
+                             amd::CMD_GET_BOOTSTRAP_ACC,
+                             ipmi::Privilege::Admin, // SYSTEM_INTERFACE - mapped in phosphor-ipmi-host/ipmid-new.cpp
+                             ipmiOemAMDGetBootStrapAccount);
 }
 
 } // namespace ipmi

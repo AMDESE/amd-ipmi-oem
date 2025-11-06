@@ -6,6 +6,10 @@
 
 namespace amd {
 
+constexpr auto CMD_PLATFORM_ID = 0x01;
+constexpr auto CMD_GET_BOOTSTRAP_ACC = 0x02;
+constexpr auto REDFISH_BOOTSTRAP_GRPEXT_ID = 0x52;
+
 enum ipmi_amd_net_fns {
   NETFN_OEM_AMD = 0x30,
 };
@@ -21,6 +25,11 @@ enum {
 
 struct AMDIANAHeader {
   uint8_t iana[3];
+} __attribute__((packed));
+
+struct GetBootstrapAccCreds {
+  uint8_t groupExtIdentification;
+  uint8_t disableCredBootstrap;
 } __attribute__((packed));
 
 } // namespace amd
