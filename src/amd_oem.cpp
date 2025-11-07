@@ -44,7 +44,7 @@ ipmiOemAMDPlatID(Context::ptr ctx) {
 bool getRandomUserName(std::string &uniqueStr) {
   std::ifstream randFp("/dev/urandom", std::ifstream::in);
   char byte;
-  uint8_t maxStrSize = 16;
+  uint8_t maxStrSize = USERNAME_SIZE;
 
   if (!randFp.is_open()) {
     log<level::ERR>("getRandomUserName: Failed to open urandom file");
@@ -88,7 +88,7 @@ bool isValidUserName(const std::string &userName) {
 bool getRandomPassword(std::string &uniqueStr) {
   std::ifstream randFp("/dev/urandom", std::ifstream::in);
   char byte;
-  uint8_t maxStrSize = 16;
+  uint8_t maxStrSize = PASSWORD_SIZE;
   std::string invalidChar = "\'\\\"";
 
   if (!randFp.is_open()) {
@@ -245,8 +245,7 @@ void setDisableCredBootstrap(const uint8_t disableCredBootstrap) {
   return;
 }
 
-//@param disableCredBootstrap as per Redfish groupExtId for getBootstrapAcc 
-//@return when success, return 32-bytes (16-byte username, 16-byte password)
+
 ipmi::RspType<std::vector<uint8_t>>
 ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
 
@@ -342,25 +341,36 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
 
   setDisableCredBootstrap(disableCredBootstrap);
 
-  std::vector<uint8_t> res(32, 0); // 32 elements, all initialized to 0
+  std::vector<uint8_t> res(USERNAME_SIZE  + PASSWORD_SIZE, 0); // 32 elements, all initialized to 0
 
-  // Pad userName and password (32 bytes)
-  std::memcpy(res.data(),            userName.data(), 16);
-  std::memcpy(res.data() + 16,       password.data(), 16);
+  // Pad userName and password
+  std::memcpy(res.data(),                   userName.data(), USERNAME_SIZE);
+  std::memcpy(res.data() + USERNAME_SIZE,   password.data(), PASSWORD_SIZE);
 
   return ipmi::responseSuccess(res);
 }
 
 void registerOEMFunctions(void) {
 
-  //NetFn=0x2C (For groupHandler)
+  log<level::NOTICE>(
+      "Registering ipmiOemAMDPlatID: ",
+      entry("NetFn:[%02Xh], ", IPMI_GROUP_HANDLER),
+      entry("Cmd:[%02Xh], ", CMD_PLATFORM_ID),
+      entry("GroupId:[%02Xh]", REDFISH_BOOTSTRAP_GRPEXT_ID));
+
   ipmi::registerGroupHandler(ipmi::prioOemBase,
                              amd::REDFISH_BOOTSTRAP_GRPEXT_ID,
                              amd::CMD_PLATFORM_ID,
                              ipmi::Privilege::User,
                              ipmiOemAMDPlatID);
 
-  ipmi::registerGroupHandler(ipmi::prioOemBase,
+  log<level::NOTICE>(
+      "Registering ipmiOemAMDGetBootStrapAccount: ",
+      entry("NetFn:[%02Xh], ", IPMI_GROUP_HANDLER),
+      entry("Cmd:[%02Xh], ", CMD_GET_BOOTSTRAP_ACC),
+      entry("GroupId:[%02Xh]", REDFISH_BOOTSTRAP_GRPEXT_ID));
+
+      ipmi::registerGroupHandler(ipmi::prioOemBase,
                              amd::REDFISH_BOOTSTRAP_GRPEXT_ID,
                              amd::CMD_GET_BOOTSTRAP_ACC,
                              ipmi::Privilege::Admin, // SYSTEM_INTERFACE - mapped in phosphor-ipmi-host/ipmid-new.cpp
