@@ -257,20 +257,29 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
     return ipmi::responseCommandDisabled();
   }
 
-  std::string userName;
+  std::string randomUserName;
 
-  bool ret = getRandomUserName(userName);
+  bool ret = getRandomUserName(randomUserName);
   if (!ret) {
     log<level::ERR>(
         "ipmiOemAMDGetBootStrapAccount: Failed to generate alphanumeric "
         "UserName");
     return ipmi::responseResponseError();
   }
+
+  constexpr std::string_view bootstrapSuffix = "bsu";
+  static_assert(USERNAME_SIZE >= bootstrapSuffix.size(),
+                "USERNAME_SIZE must be >= bootstrap suffix size");
+
+  std::string userName = randomUserName.substr(0, USERNAME_SIZE - bootstrapSuffix.size()) +
+             std::string(bootstrapSuffix);
+
   if (!isValidUserName(userName)) {
     log<level::ERR>(
         "ipmiOemAMDGetBootStrapAccount: Failed to generate valid UserName");
     return ipmi::responseResponseError();
   }
+
   auto bus = sdbusplus::bus::new_default();
   const std::string userMgrService = "xyz.openbmc_project.User.Manager";
   const std::string userMgrPath = "/xyz/openbmc_project/user";
