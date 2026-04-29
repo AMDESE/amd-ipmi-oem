@@ -22,7 +22,9 @@ namespace ipmi {
 
 using namespace phosphor::logging;
 using namespace amd;
-bool credentialBootstrapping = true;
+static std::mutex credentialBootstrappingMutex;
+constexpr uint8_t credBootstrapEnabled = 0xA5;
+static bool credentialBootstrappingControl = false;
 
 // static void registerOEMFunctions() __attribute__((constructor));
 void registerOEMFunctions() __attribute__((constructor(101)));
@@ -235,26 +237,60 @@ int pamUpdatePasswd(const char *username, const char *password) {
   return pam_end(localAuthHandle, PAM_SUCCESS);
 }
 
-void setDisableCredBootstrap(const uint8_t disableCredBootstrap) {
-  const uint8_t credBootstrapEnabled = 0xA5;
-  if (disableCredBootstrap == credBootstrapEnabled) {
-    credentialBootstrapping = true;
-  } else {
-    credentialBootstrapping = false;
-  }
-  return;
+static bool stopUsbNetworkService()
+{
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+
+        auto method = bus.new_method_call(
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StopUnit");
+
+        method.append("usb_network.service", "replace");
+
+        auto reply = bus.call(method);
+    }
+    catch (const std::exception& e)
+    {
+        log<level::ERR>("Failed to stop usb_network.service");
+        return false;
+    }
+
+    log<level::INFO>("Successfully stopped usb_network.service");
+    return true;
 }
 
+static void setCredentialBootstrappingState(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(credentialBootstrappingMutex);
+    credentialBootstrappingControl = enabled;
+}
+
+static void disableAllCredentialBootstrappingUsers()
+{
+    std::lock_guard<std::mutex> lock(credentialBootstrappingMutex);
+    credentialBootstrappingControl = false;
+}
 
 ipmi::RspType<std::vector<uint8_t>>
 ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
 
   (void)ctx;
 
-  if (!credentialBootstrapping) {
-    log<level::ERR>("ipmiOemAMDGetBootStrapAccount: Credential BootStrapping "
-                    "Disabled; Get BootStrap Account command rejected.");
-    return ipmi::responseCommandDisabled();
+  if (disableCredBootstrap != credBootstrapEnabled) {
+    disableAllCredentialBootstrappingUsers();
+
+    if (!stopUsbNetworkService()) {
+        log<level::ERR>("Failed to issue USB gadget unbind on disable request");
+        return ipmi::responseResponseError();
+    }
+
+    log<level::ERR>("disable credential bootstrapping");
+    std::vector<uint8_t> res(USERNAME_SIZE + PASSWORD_SIZE, 0);
+    return ipmi::responseSuccess(res);
   }
 
   std::string randomUserName;
@@ -271,8 +307,9 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
   static_assert(USERNAME_SIZE >= bootstrapSuffix.size(),
                 "USERNAME_SIZE must be >= bootstrap suffix size");
 
-  std::string userName = randomUserName.substr(0, USERNAME_SIZE - bootstrapSuffix.size()) +
-             std::string(bootstrapSuffix);
+  std::string userName =
+      randomUserName.substr(0, USERNAME_SIZE - bootstrapSuffix.size()) +
+      std::string(bootstrapSuffix);
 
   if (!isValidUserName(userName)) {
     log<level::ERR>(
@@ -290,10 +327,8 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
         bus.new_method_call(userMgrService.c_str(), userMgrPath.c_str(),
                             userMgrInterface.c_str(), "CreateUser");
 
-    // TODO: Change the usergroup to host-redfish, once this option is enabled
-    // in user-manager
     method.append(userName, std::vector<std::string>{"redfish"}, "priv-admin",
-                  true); // Enabled
+                  true);
 
     auto reply = bus.call(method);
     if (reply.is_method_error()) {
@@ -311,6 +346,7 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
   int max_retries = 10;
 
   while (!passwordIsValid && (max_retries != 0)) {
+    password.clear();
     ret = getRandomPassword(password);
     if (!ret) {
       log<level::ERR>(
@@ -328,8 +364,6 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
     return ipmi::responseResponseError();
   }
 
-  // update the password
-  boost::system::error_code ec;
   int retval = pamUpdatePasswd(userName.c_str(), password.c_str());
   if (retval != PAM_SUCCESS) {
     try {
@@ -342,19 +376,19 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
         return ipmi::responseResponseError();
       }
     } catch (const std::exception &e) {
-      log<level::ERR>("Exception during D-Bus user creation",
+      log<level::ERR>("Exception during D-Bus user deletion",
                       phosphor::logging::entry("EX=%s", e.what()));
       return ipmi::responseResponseError();
     }
+    return ipmi::responseResponseError();
   }
 
-  setDisableCredBootstrap(disableCredBootstrap);
+  setCredentialBootstrappingState(true);
 
-  std::vector<uint8_t> res(USERNAME_SIZE  + PASSWORD_SIZE, 0); // 32 elements, all initialized to 0
+  std::vector<uint8_t> res(USERNAME_SIZE + PASSWORD_SIZE, 0);
 
-  // Pad userName and password
-  std::memcpy(res.data(),                   userName.data(), USERNAME_SIZE);
-  std::memcpy(res.data() + USERNAME_SIZE,   password.data(), PASSWORD_SIZE);
+  std::memcpy(res.data(), userName.data(), USERNAME_SIZE);
+  std::memcpy(res.data() + USERNAME_SIZE, password.data(), PASSWORD_SIZE);
 
   return ipmi::responseSuccess(res);
 }
