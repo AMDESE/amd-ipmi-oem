@@ -237,6 +237,32 @@ int pamUpdatePasswd(const char *username, const char *password) {
   return pam_end(localAuthHandle, PAM_SUCCESS);
 }
 
+static bool stopUsbNetworkService()
+{
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+
+        auto method = bus.new_method_call(
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StopUnit");
+
+        method.append("usb_network.service", "replace");
+
+        auto reply = bus.call(method);
+    }
+    catch (const std::exception& e)
+    {
+        log<level::ERR>("Failed to stop usb_network.service");
+        return false;
+    }
+
+    log<level::INFO>("Successfully stopped usb_network.service");
+    return true;
+}
+
 static void setCredentialBootstrappingState(bool enabled)
 {
     std::lock_guard<std::mutex> lock(credentialBootstrappingMutex);
@@ -256,6 +282,11 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
 
   if (disableCredBootstrap != credBootstrapEnabled) {
     disableAllCredentialBootstrappingUsers();
+
+    if (!stopUsbNetworkService()) {
+        log<level::ERR>("Failed to issue USB gadget unbind on disable request");
+        return ipmi::responseResponseError();
+    }
 
     log<level::ERR>("disable credential bootstrapping");
     std::vector<uint8_t> res(USERNAME_SIZE + PASSWORD_SIZE, 0);
