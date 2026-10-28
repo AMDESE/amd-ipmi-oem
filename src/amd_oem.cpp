@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <ipmid/api.h>
+#include <ipmid/api.hpp>
 #include <ipmid/handler.hpp>
 #include <phosphor-logging/log.hpp>
 #include <random>
@@ -15,9 +16,15 @@
 #include <security/pam_appl.h>
 #include <sstream>
 #include <string>
+#include <map>
+#include <memory>
+#include <variant>
+#include <vector>
 // #include <cstring>
 
+#include <sdbusplus/asio/connection.hpp>
 #include <sdbusplus/bus.hpp>
+#include <sdbusplus/bus/match.hpp>
 #include <sdbusplus/message.hpp>
 
 namespace ipmi {
@@ -303,6 +310,115 @@ static bool stopUsbNetworkService(int instance)
     return true;
 }
 
+// Bring the per-host USB vNIC back up for a fresh credential-bootstrapping /
+// inventory-push window. The service is torn down (stopUsbNetworkService) once
+// BIOS finishes bootstrapping, and is only auto-started by multi-user.target at
+// BMC boot. Without an explicit start here, every host-only reboot after the
+// first leaves the vNIC down, so BIOS can no longer reach the BMC to push
+// PCIe/DIMM/Storage inventory (reported as inventory missing/stale across
+// reboots). StartUnit is idempotent, so calling it when already active is safe.
+static bool startUsbNetworkService(int instance)
+{
+    const std::string unit =
+        "usb_network@" + std::to_string(instance) + ".service";
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+
+        auto method = bus.new_method_call(
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StartUnit");
+
+        method.append(unit, "replace");
+
+        auto reply = bus.call(method);
+    }
+    catch (const std::exception& e)
+    {
+        log<level::ERR>(("Failed to start " + unit).c_str());
+        return false;
+    }
+
+    log<level::INFO>(("Successfully started " + unit).c_str());
+    return true;
+}
+
+// Keeps the per-host CurrentHostState watches alive for the lifetime of the
+// provider.
+static std::vector<std::unique_ptr<sdbusplus::bus::match::match>>
+    hostPowerOnMatches;
+
+// Arm the per-host USB vNIC on every host power-on.
+//
+// BIOS only runs the Redfish Host Interface flow (GetBootStrapAccount + the
+// PCIe/DIMM/Storage inventory push) when the vNIC is already up; if it is down,
+// BIOS never calls GetBootStrapAccount, so starting the vNIC from that command
+// alone is circular and cannot recover a host-only reboot. The vNIC is also
+// torn down after each boot's bootstrap-disable, so it must be re-armed every
+// time the host powers on, independent of BIOS.
+//
+// Watch xyz.openbmc_project.State.Host.CurrentHostState for each host and start
+// usb_network@<instance> as soon as the host begins powering on
+// (TransitioningToRunning or Running). StartUnit is idempotent and the unit's
+// ConditionPathExists gates it to the active partition, so starting an inactive
+// instance is a harmless no-op.
+static void setupHostPowerOnVnicWatch()
+{
+    auto bus = getSdBus();
+    if (!bus)
+    {
+        log<level::ERR>("vNIC power-on watch: no system bus available");
+        return;
+    }
+
+    for (int instance = 0; instance <= 2; ++instance)
+    {
+        const std::string path =
+            "/xyz/openbmc_project/state/host" + std::to_string(instance);
+
+        hostPowerOnMatches.emplace_back(
+            std::make_unique<sdbusplus::bus::match::match>(
+                *bus,
+                sdbusplus::bus::match::rules::propertiesChanged(
+                    path, "xyz.openbmc_project.State.Host"),
+                [instance](sdbusplus::message_t& msg) {
+                    try
+                    {
+                        std::string iface;
+                        std::map<std::string, std::variant<std::string>> props;
+                        msg.read(iface, props);
+
+                        auto it = props.find("CurrentHostState");
+                        if (it == props.end())
+                        {
+                            return;
+                        }
+
+                        const std::string* state =
+                            std::get_if<std::string>(&it->second);
+                        // Matches both HostState.Running and
+                        // HostState.TransitioningToRunning.
+                        if (state != nullptr &&
+                            state->find("Running") != std::string::npos)
+                        {
+                            startUsbNetworkService(instance);
+                        }
+                    }
+                    catch (const std::exception& e)
+                    {
+                        log<level::ERR>(
+                            "vNIC power-on watch: failed to handle host state "
+                            "change",
+                            entry("EX=%s", e.what()));
+                    }
+                }));
+    }
+
+    log<level::INFO>("Installed per-host vNIC power-on watches");
+}
+
 static void setCredentialBootstrappingState(bool enabled)
 {
     std::lock_guard<std::mutex> lock(credentialBootstrappingMutex);
@@ -425,6 +541,15 @@ ipmiOemAMDGetBootStrapAccount(Context::ptr ctx, uint8_t disableCredBootstrap) {
     return ipmi::responseResponseError();
   }
 
+  // Re-arm the per-host vNIC so BIOS can push inventory this boot. It was torn
+  // down after the previous boot's bootstrap-disable and is otherwise only
+  // started at BMC boot, which breaks the push on host-only reboots.
+  if (!startUsbNetworkService(host.instance)) {
+    log<level::ERR>("Failed to start per-host USB vNIC for credential "
+                    "bootstrapping");
+    return ipmi::responseResponseError();
+  }
+
   setCredentialBootstrappingState(true);
 
   std::vector<uint8_t> res(USERNAME_SIZE + PASSWORD_SIZE, 0);
@@ -516,6 +641,11 @@ void registerOEMFunctions(void) {
                              amd::CMD_GET_HOST_INTERFACE_IP,
                              ipmi::Privilege::Admin,
                              ipmiOemAMDGetHostInterfaceIP);
+
+  // Re-arm the per-host USB vNIC on every host power-on so BIOS can always
+  // reach the BMC to push inventory, even on host-only reboots where it reuses
+  // cached bootstrap credentials and never calls GetBootStrapAccount.
+  setupHostPowerOnVnicWatch();
 }
 
 } // namespace ipmi
