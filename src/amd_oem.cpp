@@ -319,6 +319,16 @@ static bool stopUsbNetworkService(int instance)
 // reboots). StartUnit is idempotent, so calling it when already active is safe.
 static bool startUsbNetworkService(int instance)
 {
+    // Instance 2 is the P1 vNIC (usbeth1 on 12021000). The current Nigeria
+    // BIOS leaves socket1 XHCI0 off, and binding this gadget wedges host2 in
+    // XhcStopEndpoint. Leave it stopped; `systemctl start usb_network@2`
+    // still brings it up once that controller is enabled.
+    if (instance == 2)
+    {
+        log<level::INFO>("startUsbNetworkService: skipping usb_network@2");
+        return true;
+    }
+
     const std::string unit =
         "usb_network@" + std::to_string(instance) + ".service";
     try
